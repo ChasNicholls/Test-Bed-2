@@ -45,54 +45,6 @@ function parseAmount(s) {
   return Number(s) || 0;
 }
 
-
-// === Keyword enrichment & PayPal merchant detection (added) ===
-function dePunctLower(s){
-  return String(s||'').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g,' ').trim();
-}
-
-// Detect merchant words immediately following a PayPal token
-// Examples handled:
-//  - "PAYPAL *UBER BV 4029357733" -> "uber bv"
-//  - "PayPal-Spotify PTE LTD INV 8899" -> "spotify pte"
-//  - "PP*NETFLIX.COM 888-***" -> "netflix com"
-//  - "PAYPAL: EBAY AUSTRALIA #REF(123)" -> "ebay australia"
-function extractPayPalMerchant(raw) {
-  if (!raw) return "";
-  const s = String(raw).replace(/\s+/g, " ").trim();
-  if (!/(paypal|pp\*)/i.test(s)) return "";
-
-  // Normalize immediate separators after the PayPal token
-  const norm = s \
-    .replace(/pp\*/i, "paypal ") \
-    .replace(/paypal\s*[:\-*]\s*/i, "paypal ");
-
-  // Capture 1–3 words after "paypal"
-  const m = norm.match(/paypal\s+([a-z0-9.&]+(?:\s+[a-z.&]+){0,2})/i);
-  if (!m) return "";
-
-  let cand = m[1];
-
-  // Trim trailing noise
-  cand = cand \
-    .replace(/\b(inv|invoice|receipt|ref|order|txn|id|au|us|uk)\b.*$/i, "") \
-    .replace(/[#(].*$/,"") \
-    .replace(/\d{3,}.*$/,"") \
-    .trim();
-
-  // Title-casing not necessary for matching; we return lower for includes()
-  return dePunctLower(cand);
-}
-
-// Build a search haystack from a txn description with PayPal vendor (if present)
-function buildSearchHay(desc){
-  const vendorPP = extractPayPalMerchant(desc);
-  // Put vendor first so simple 'includes' rules like "uber" hit
-  let hay = vendorPP ? (vendorPP + " " + desc) : String(desc||"");
-  return dePunctLower(hay);
-}
-
-
 function loadCsvText(csvText) {
   const rows = Papa.parse(csvText.trim(), { skipEmptyLines: true }).data;
   const startIdx = rows.length && isNaN(parseAmount(rows[0][COL.DEBIT])) ? 1 : 0;
@@ -193,12 +145,43 @@ function parseRules(text) {
   return rules;
 }
 
+// Upsert a single "KEYWORD => CATEGORY" line into rulesBox (update if keyword exists, else append)
+function upsertRuleLine(keywordRaw, categoryRaw) {
+  const box = document.getElementById('rulesBox');
+  if (!box) return;
+  const KEY = String(keywordRaw || '').trim().toUpperCase();
+  const CAT = String(categoryRaw || '').trim().toUpperCase();
+  if (!KEY || !CAT) return;
+
+  const lines = String(box.value || '').split(/\r?\n/);
+  let updated = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = (lines[i] || '').trim();
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split(/=>/i);
+    if (parts.length >= 2) {
+      const k = parts[0].trim().toUpperCase();
+      if (k === KEY) {
+        lines[i] = `${KEY} => ${CAT}`; // update existing keyword → new category
+        updated = true;
+        break;
+      }
+    }
+  }
+  if (!updated) {
+    lines.push(`${KEY} => ${CAT}`);
+  }
+  box.value = lines.join('\n');
+  try { localStorage.setItem('spendlite_rules', box.value); } catch {}
+}
+
+
 function categorise(txns, rules) {
   for (const t of txns) {
-    const hay = buildSearchHay(t.description);
+    const desc = t.description.toLowerCase();
     let matched = 'UNCATEGORISED';
     for (const r of rules) {
-      if (hay.includes(r.keyword)) { matched = r.category; break; }
+      if (desc.includes(r.keyword)) { matched = r.category; break; }
     }
     t.category = matched;
   }
@@ -254,7 +237,7 @@ function renderMonthTotals() {
   const el = document.getElementById('monthTotals');
   if (el) {
     const label = friendlyMonthOrAll(MONTH_FILTER);
-    const cat = CURRENT_FILTER ? ` + category "${CURRENT_FILTER}"` : "";
+    const cat = CURRENT_FILTER ? ` + category \"${CURRENT_FILTER}\"` : "";
     el.innerHTML = `Showing <span class="badge">${count}</span> transactions for <strong>${friendlyMonthOrAll(MONTH_FILTER)}${cat}</strong> · ` +
                    `Debit: <strong>$${debit.toFixed(2)}</strong> · ` +
                    `Credit: <strong>$${credit.toFixed(2)}</strong> · ` +
@@ -293,7 +276,7 @@ function renderTotalsBar(txns) {
 }
 
 
-function exportTotals() {
+function exportTotalsold() {
   const txns = monthFilteredTxns();
   const { rows, grand } = computeCategoryTotals(txns);
   // Always use a friendly label like "August 2025" for both header and filename
@@ -314,6 +297,52 @@ function exportTotals() {
   a.click();
   a.remove();
 }
+function exportTotals() {
+  const txns = monthFilteredTxns();
+  const { rows, grand } = computeCategoryTotals(txns);
+
+  const label = friendlyMonthOrAll(MONTH_FILTER || getFirstTxnMonth(txns) || new Date());
+  const header = `SpendLite Category Totals (${label})`;
+
+  // dynamic widths for neat alignment
+  const catWidth = Math.max(8, ...rows.map(([cat]) => toTitleCase(cat).length), 'Category'.length);
+  const amtWidth = 12;
+  const pctWidth = 6;
+
+  const lines = [];
+  lines.push(header);
+  lines.push('='.repeat(header.length));
+  lines.push(
+    'Category'.padEnd(catWidth) + ' ' +
+    'Amount'.padStart(amtWidth) + ' ' +
+    '%'.padStart(pctWidth)
+  );
+
+  for (const [cat, total] of rows) {
+    const pct = grand ? (total / grand * 100) : 0;
+    lines.push(
+      toTitleCase(cat).padEnd(catWidth) + ' ' +
+      total.toFixed(2).padStart(amtWidth) + ' ' +
+      (pct.toFixed(1) + '%').padStart(pctWidth)
+    );
+  }
+
+  lines.push('');
+  lines.push(
+    'TOTAL'.padEnd(catWidth) + ' ' +
+    grand.toFixed(2).padStart(amtWidth) + ' ' +
+    '100%'.padStart(pctWidth)
+  );
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `category_totals_${forFilename(label)}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 
 function getFilteredTxns(txns) {
   if (!CURRENT_FILTER) return txns;
@@ -323,7 +352,7 @@ function getFilteredTxns(txns) {
 function updateFilterUI() {
   const label = document.getElementById('activeFilter');
   const btn = document.getElementById('clearFilterBtn');
-  if (CURRENT_FILTER) { label.textContent = `— filtered by "${CURRENT_FILTER}"`; btn.style.display = ''; }
+  if (CURRENT_FILTER) { label.textContent = `— filtered by \"${CURRENT_FILTER}\"`; btn.style.display = ''; }
   else { label.textContent = ''; btn.style.display = 'none'; }
 }
 
@@ -357,36 +386,64 @@ function renderTransactionsTable(txns = monthFilteredTxns()) {
   renderPager(totalPages);
 }
 
+// --- helper: get next word after a marker (e.g., "paypal")
+function nextWordAfter(marker, desc) {
+  const lower = (desc || '').toLowerCase();
+  const i = lower.indexOf(String(marker).toLowerCase());
+  if (i === -1) return '';
+  // slice after the marker, trim separators like space, dash, colon, slash, asterisk
+  let after = (desc || '').slice(i + String(marker).length).replace(/^[\s\-:\/*]+/, '');
+  const m = after.match(/^([A-Za-z0-9&._]+)/); // merchant-like token
+  return m ? m[1] : '';
+}
+
 
 function assignCategory(idx) {
   const txn = CURRENT_TXNS[idx];
   if (!txn) return;
-  let desc = txn.description || "";
-  let suggested = "";
+  const desc = txn.description || "";
   const up = desc.toUpperCase();
 
-  // Prefer PayPal merchant if detected
-  const pp = extractPayPalMerchant(desc);
-  if (pp) {
-    suggested = pp.toUpperCase();
-  } else {
-    const visaPos = up.indexOf("VISA-");
-    if (visaPos !== -1) {
-      const after = desc.substring(visaPos + 5).trim();
-      suggested = (after.split(/\s+/)[0] || "").toUpperCase();
-    } else {
-      suggested = (desc.split(/\s+/)[0] || "").toUpperCase();
-    }
-  }
-  const chosenKeyword = prompt("Enter keyword to match:", suggested);
+  // If description contains PAYPAL, automatically take the next word and upsert rule without prompts
+  if (/\bPAYPAL\b/.test(up)) {
+    const nxt = nextWordAfter('paypal', desc);
+    const keyword = ('PAYPAL' + (nxt ? ' ' + nxt : '')).toUpperCase();
 
+    // Choose category: if txn already has a category (and not UNCATEGORISED) keep it, else use that next word as category
+    const existingCat = (txn.category || '').toUpperCase();
+    const category = existingCat && existingCat !== 'UNCATEGORISED'
+      ? existingCat
+      : (nxt ? nxt.toUpperCase() : 'PAYPAL');
+
+    upsertRuleLine(keyword, category);
+    applyRulesAndRender();
+    // Optional tiny feedback
+    try {
+      const el = document.getElementById('rulesStatus');
+      if (el) el.textContent = `Added: ${keyword} => ${category}`;
+    } catch {}
+    return;
+  }
+
+  // Otherwise, use the existing manual prompt flow (VISA-/first word etc.)
+  let suggested = "";
+  const visaPos = up.indexOf("VISA-");
+  if (visaPos !== -1) {
+    const after = desc.substring(visaPos + 5).trim();
+    suggested = (after.split(/\s+/)[0] || "").toUpperCase();
+  } else {
+    suggested = (desc.split(/\s+/)[0] || "").toUpperCase();
+  }
+
+  const chosenKeyword = prompt("Enter keyword to match:", suggested);
   if (!chosenKeyword) return;
   const category = (prompt("Enter category name:", (txn.category || "UNCATEGORISED").toUpperCase()) || "").toUpperCase();
   if (!category) return;
-  const rulesBox = document.getElementById('rulesBox');
-  rulesBox.value += `\n${chosenKeyword} => ${category}`;
+
+  upsertRuleLine(chosenKeyword, category);
   applyRulesAndRender();
 }
+
 
 function exportRules() {
   const text = document.getElementById('rulesBox').value || '';
@@ -566,3 +623,5 @@ document.addEventListener('DOMContentLoaded', () => { try { updateMonthBanner();
 window.addEventListener('beforeunload', () => {
   try { localStorage.setItem(LS_KEYS.TXNS_JSON, JSON.stringify(CURRENT_TXNS||[])); } catch {}
 });
+document.getElementById('exportTotalsBtn')
+  .addEventListener('click', exportTotals);
